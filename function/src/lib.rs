@@ -22,23 +22,17 @@ extern crate sgx_tstd as std;
 #[cfg(feature = "mesalock_sgx")]
 use std::prelude::v1::*;
 
-#[macro_use]
-extern crate log;
-
-mod context;
 mod echo;
-mod gbdt_prediction;
-mod gbdt_training;
-mod logistic_regression_prediction;
-mod logistic_regression_training;
-mod mesapy;
+mod gbdt_predict;
+mod gbdt_train;
+mod logistic_regression_predict;
+mod logistic_regression_train;
 
 pub use echo::Echo;
-pub use gbdt_prediction::GbdtPrediction;
-pub use gbdt_training::GbdtTraining;
-pub use logistic_regression_prediction::LogitRegPrediction;
-pub use logistic_regression_training::LogitRegTraining;
-pub use mesapy::Mesapy;
+pub use gbdt_predict::GbdtPredict;
+pub use gbdt_train::GbdtTrain;
+pub use logistic_regression_predict::LogisticRegressionPredict;
+pub use logistic_regression_train::LogisticRegressionTrain;
 
 #[cfg(feature = "enclave_unit_test")]
 pub mod tests {
@@ -48,12 +42,10 @@ pub mod tests {
     pub fn run_tests() -> bool {
         check_all_passed!(
             echo::tests::run_tests(),
-            gbdt_training::tests::run_tests(),
-            gbdt_prediction::tests::run_tests(),
-            mesapy::tests::run_tests(),
-            context::tests::run_tests(),
-            logistic_regression_training::tests::run_tests(),
-            logistic_regression_prediction::tests::run_tests(),
+            gbdt_train::tests::run_tests(),
+            gbdt_predict::tests::run_tests(),
+            logistic_regression_train::tests::run_tests(),
+            logistic_regression_predict::tests::run_tests(),
         )
     }
 }

@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::prelude::v1::*;
 use std::sync::{Arc, SgxMutex as Mutex};
 
@@ -34,10 +35,14 @@ static WORKER_BASE_DIR: &str = "/tmp/teaclave_agent/";
 pub(crate) struct TeaclaveExecutionService {
     worker: Arc<Worker>,
     scheduler_client: Arc<Mutex<TeaclaveSchedulerClient>>,
+    fusion_base: PathBuf,
 }
 
 impl TeaclaveExecutionService {
-    pub(crate) fn new(scheduler_service_endpoint: Endpoint) -> Result<Self> {
+    pub(crate) fn new(
+        scheduler_service_endpoint: Endpoint,
+        fusion_base: impl AsRef<Path>,
+    ) -> Result<Self> {
         let mut i = 0;
         let channel = loop {
             match scheduler_service_endpoint.connect() {
@@ -55,6 +60,7 @@ impl TeaclaveExecutionService {
         Ok(TeaclaveExecutionService {
             worker: Arc::new(Worker::default()),
             scheduler_client,
+            fusion_base: fusion_base.as_ref().to_owned(),
         })
     }
 
@@ -64,7 +70,7 @@ impl TeaclaveExecutionService {
             let staged_task = match self.pull_task() {
                 Ok(staged_task) => staged_task,
                 Err(e) => {
-                    log::error!("PullTask Error: {:?}", e);
+                    log::warn!("PullTask Error: {:?}", e);
                     continue;
                 }
             };
@@ -97,17 +103,17 @@ impl TeaclaveExecutionService {
     }
 
     fn invoke_task(&mut self, task: &StagedTask) -> Result<TaskOutputs> {
+        self.update_task_status(&task.task_id, TaskStatus::Running)?;
+
         let file_mgr = TaskFileManager::new(
             WORKER_BASE_DIR,
+            &self.fusion_base,
             &task.task_id,
             &task.input_data,
             &task.output_data,
         )?;
-
-        self.update_task_status(&task.task_id, TaskStatus::DataPreparing, String::new())?;
         let invocation = prepare_task(&task, &file_mgr)?;
 
-        self.update_task_status(&task.task_id, TaskStatus::Running, String::new())?;
         log::info!("Invoke function: {:?}", invocation);
         let worker = Worker::default();
         let summary = worker.invoke_function(invocation)?;
@@ -134,13 +140,8 @@ impl TeaclaveExecutionService {
         Ok(())
     }
 
-    fn update_task_status(
-        &mut self,
-        task_id: &Uuid,
-        task_status: TaskStatus,
-        status_info: String,
-    ) -> Result<()> {
-        let request = UpdateTaskStatusRequest::new(task_id.to_owned(), task_status, status_info);
+    fn update_task_status(&mut self, task_id: &Uuid, task_status: TaskStatus) -> Result<()> {
+        let request = UpdateTaskStatusRequest::new(task_id.to_owned(), task_status);
         let _response = self
             .scheduler_client
             .clone()
@@ -160,8 +161,9 @@ fn prepare_task(task: &StagedTask, file_mgr: &TaskFileManager) -> Result<StagedF
     let staged_function = StagedFunction::new()
         .executor_type(task.executor_type)
         .executor(task.executor)
-        .payload(function_payload)
+        .name(&task.function_name)
         .arguments(task.function_arguments.clone())
+        .payload(function_payload)
         .input_files(input_files)
         .output_files(output_files)
         .runtime_name("default");
@@ -184,11 +186,13 @@ pub mod tests {
         let task_id = Uuid::new_v4();
         let staged_task = StagedTask::new()
             .task_id(task_id)
-            .executor(Executor::Echo)
+            .executor(Executor::Builtin)
+            .function_name("builtin-echo")
             .function_arguments(hashmap!("message" => "Hello, Teaclave!"));
 
         let file_mgr = TaskFileManager::new(
             WORKER_BASE_DIR,
+            "/tmp/fusion_base",
             &staged_task.task_id,
             &staged_task.input_data,
             &staged_task.output_data,
@@ -204,7 +208,7 @@ pub mod tests {
         assert_eq!(result.unwrap(), "Hello, Teaclave!");
     }
 
-    pub fn test_invoke_gbdt_training() {
+    pub fn test_invoke_gbdt_train() {
         let task_id = Uuid::new_v4();
         let function_arguments = FunctionArguments::new(hashmap!(
             "feature_size"                => "4",
@@ -238,13 +242,15 @@ pub mod tests {
 
         let staged_task = StagedTask::new()
             .task_id(task_id)
-            .executor(Executor::GbdtTraining)
+            .executor(Executor::Builtin)
+            .function_name("builtin-gbdt-train")
             .function_arguments(function_arguments)
             .input_data(input_data)
             .output_data(output_data);
 
         let file_mgr = TaskFileManager::new(
             WORKER_BASE_DIR,
+            "/tmp/fusion_base",
             &staged_task.task_id,
             &staged_task.input_data,
             &staged_task.output_data,

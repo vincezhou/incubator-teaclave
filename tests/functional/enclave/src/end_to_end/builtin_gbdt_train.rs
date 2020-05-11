@@ -62,10 +62,8 @@ fn register_gbdt_function(client: &mut TeaclaveFrontendClient) -> ExternalID {
 
     // Register Function
     let request = RegisterFunctionRequest::new()
-        .name("native_gbdt_training_demo")
+        .name("builtin-gbdt-train")
         .description("Native Gbdt Training Function")
-        .executor_type(ExecutorType::Native)
-        .public(true)
         .arguments(fn_args)
         .inputs(vec![fn_input])
         .outputs(vec![fn_output]);
@@ -106,7 +104,7 @@ fn create_gbdt_training_task(
     function_id: &ExternalID,
 ) -> ExternalID {
     let request = CreateTaskRequest::new()
-        .executor(Executor::GbdtTraining)
+        .executor(Executor::Builtin)
         .function_id(function_id.clone())
         .function_arguments(hashmap!(
             "feature_size"          => "4",
@@ -119,8 +117,8 @@ fn create_gbdt_training_task(
             "loss"                  => "LAD",
             "training_optimization_level" => "2"
         ))
-        .input_owners_map(hashmap!("training_data" => vec![USERNAME]))
-        .output_owners_map(hashmap!("trained_model" => vec![USERNAME]));
+        .inputs_ownership(hashmap!("training_data" => vec![USERNAME]))
+        .outputs_ownership(hashmap!("trained_model" => vec![USERNAME]));
 
     let response = client.create_task(request).unwrap();
     log::info!("Create task: {:?}", response);

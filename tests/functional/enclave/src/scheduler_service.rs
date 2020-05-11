@@ -29,8 +29,9 @@ fn test_pull_task() {
     let function_id = Uuid::new_v4();
     let staged_task = StagedTask::new()
         .task_id(Uuid::new_v4())
+        .function_name("builtin-echo")
         .function_id(function_id.clone())
-        .executor(Executor::Echo);
+        .executor(Executor::Builtin);
 
     let mut storage_client = get_storage_client();
     let enqueue_request = EnqueueRequest::new(
@@ -52,7 +53,7 @@ fn test_update_task_status_result() {
     let task_id = Uuid::new_v4();
     let task = Task {
         task_id,
-        status: TaskStatus::Running,
+        status: TaskStatus::Staged,
         ..Default::default()
     };
 
@@ -60,8 +61,9 @@ fn test_update_task_status_result() {
 
     let staged_task = StagedTask::new()
         .task_id(task_id.clone())
+        .function_name("builtin-echo")
         .function_id(function_id)
-        .executor(Executor::Echo);
+        .executor(Executor::Builtin);
 
     let mut storage_client = get_storage_client();
     let enqueue_request = EnqueueRequest::new(
@@ -79,7 +81,7 @@ fn test_update_task_status_result() {
     log::debug!("response: {:?}", response);
     let task_id = response.staged_task.task_id;
 
-    let request = UpdateTaskStatusRequest::new(task_id, TaskStatus::Running, String::new());
+    let request = UpdateTaskStatusRequest::new(task_id, TaskStatus::Running);
     let response = client.update_task_status(request);
     assert!(response.is_ok());
 

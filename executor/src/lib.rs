@@ -17,20 +17,31 @@
 
 #![cfg_attr(feature = "mesalock_sgx", no_std)]
 #[cfg(feature = "mesalock_sgx")]
-#[macro_use]
 extern crate sgx_tstd as std;
 
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+#[cfg(feature = "mesalock_sgx")]
+use std::prelude::v1::*;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ConfigSource {
-    Path(PathBuf),
+#[macro_use]
+extern crate log;
+
+mod builtin;
+mod context;
+mod mesapy;
+
+pub use builtin::BuiltinFunctionExecutor;
+pub use mesapy::MesaPy;
+
+#[cfg(feature = "enclave_unit_test")]
+pub mod tests {
+    use super::*;
+    use teaclave_test_utils::check_all_passed;
+
+    pub fn run_tests() -> bool {
+        check_all_passed!(
+            context::tests::run_tests(),
+            mesapy::tests::run_tests(),
+            builtin::tests::run_tests(),
+        )
+    }
 }
-
-#[cfg(feature = "build_config")]
-pub mod build;
-mod runtime;
-
-pub use runtime::RuntimeConfig;

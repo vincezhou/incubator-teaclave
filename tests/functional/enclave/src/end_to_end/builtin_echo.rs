@@ -29,10 +29,8 @@ pub fn test_echo_task_success() {
 
     // Register Function
     let request = RegisterFunctionRequest::new()
-        .name("native_echo_demo")
+        .name("builtin-echo")
         .description("Native Echo Function")
-        .executor_type(ExecutorType::Native)
-        .public(true)
         .arguments(vec!["message"]);
 
     let response = client.register_function(request).unwrap();
@@ -44,18 +42,16 @@ pub fn test_echo_task_success() {
     let request = CreateTaskRequest::new()
         .function_id(function_id)
         .function_arguments(hashmap!("message" => "Hello From Teaclave!"))
-        .executor(Executor::Echo);
+        .executor(Executor::Builtin);
 
     let response = client.create_task(request).unwrap();
 
     log::info!("Create task: {:?}", response);
 
-    // Assign Data To Task
     let task_id = response.task_id;
-    let request = AssignDataRequest::new(task_id.clone(), hashmap!(), hashmap!());
-    let response = client.assign_data(request).unwrap();
 
-    log::info!("Assign data: {:?}", response);
+    // Assign Data To Task
+    // This task does not have any input/output files, we can skip the assignment process.
 
     // Approve Task
     approve_task(&mut client, &task_id).unwrap();

@@ -98,7 +98,7 @@ impl std::fmt::Display for ArgumentValue {
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct FunctionArguments {
     #[serde(flatten)]
-    pub inner: HashMap<String, ArgumentValue>,
+    inner: HashMap<String, ArgumentValue>,
 }
 
 impl<S: core::default::Default + std::hash::BuildHasher> From<FunctionArguments>
@@ -157,18 +157,26 @@ impl FunctionArguments {
 
 #[derive(Debug, Default)]
 pub struct StagedFunction {
-    pub executor: Executor,
-    pub payload: String,
+    pub name: String,
     pub arguments: FunctionArguments,
+    pub payload: String,
     pub input_files: StagedFiles,
     pub output_files: StagedFiles,
-    pub runtime_name: String,
     pub executor_type: ExecutorType,
+    pub executor: Executor,
+    pub runtime_name: String,
 }
 
 impl StagedFunction {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn name(self, name: impl ToString) -> Self {
+        Self {
+            name: name.to_string(),
+            ..self
+        }
     }
 
     pub fn executor(self, executor: Executor) -> Self {

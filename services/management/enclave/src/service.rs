@@ -17,7 +17,6 @@
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::prelude::v1::*;
 use std::sync::{Arc, SgxMutex as Mutex};
 use teaclave_proto::teaclave_frontend_service::{
@@ -37,9 +36,11 @@ use teaclave_proto::teaclave_storage_service::{
 use teaclave_rpc::endpoint::Endpoint;
 use teaclave_rpc::Request;
 use teaclave_service_enclave_utils::{ensure, teaclave_service};
-use teaclave_types::Function;
-#[cfg(test_mode)]
-use teaclave_types::*;
+use teaclave_types::{
+    ExternalID, FileCrypto, Function, OwnerList, StagedTask, Storable, Task, TaskStatus,
+    TeaclaveInputFile, TeaclaveOutputFile, TeaclaveServiceResponseError,
+    TeaclaveServiceResponseResult, UserID,
+};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -68,7 +69,6 @@ impl From<ServiceError> for TeaclaveServiceResponseError {
 #[derive(Clone)]
 pub(crate) struct TeaclaveManagementService {
     storage_client: Arc<Mutex<TeaclaveStorageClient>>,
-    fusion_base_dir: PathBuf,
 }
 
 impl TeaclaveManagement for TeaclaveManagementService {
@@ -266,19 +266,15 @@ impl TeaclaveManagement for TeaclaveManagementService {
             .read_from_db(&request.function_id)
             .map_err(|_| ServiceError::PermissionDenied)?;
 
-        let mut task = Task::new(
+        let task = Task::new(
             user_id,
             request.executor,
-            &function,
             request.function_arguments,
-            request.input_owners_map,
-            request.output_owners_map,
-        );
-
-        task.check_function_compatibility(&function)
-            .map_err(|_| ServiceError::BadTask)?;
-
-        task.update_status(TaskStatus::Created);
+            request.inputs_ownership,
+            request.outputs_ownership,
+            function,
+        )
+        .map_err(|_| ServiceError::BadTask)?;
 
         log::info!("CreateTask: {:?}", task);
 
@@ -312,12 +308,12 @@ impl TeaclaveManagement for TeaclaveManagementService {
             function_id: task.function_id,
             function_owner: task.function_owner,
             function_arguments: task.function_arguments,
-            input_owners_map: task.input_owners_map,
-            output_owners_map: task.output_owners_map,
+            inputs_ownership: task.inputs_ownership,
+            outputs_ownership: task.outputs_ownership,
             participants: task.participants,
             approved_users: task.approved_users,
-            input_map: task.input_map,
-            output_map: task.output_map,
+            assigned_inputs: task.assigned_inputs.external_ids(),
+            assigned_outputs: task.assigned_outputs.external_ids(),
             result: task.result,
             status: task.status,
         };
@@ -331,7 +327,7 @@ impl TeaclaveManagement for TeaclaveManagementService {
     //    * input file: user_id == input_file.owner contains user_id
     //    * output file: output_file.owner contains user_id && output_file.cmac.is_none()
     // 4) the data can be assgined to the task:
-    //    * input_owners_map or output_owners_map contains the data name
+    //    * inputs_ownership or outputs_ownership contains the data name
     //    * input file: OwnerList match input_file.owner
     //    * output file: OwnerList match output_file.owner
     fn assign_data(
@@ -351,29 +347,20 @@ impl TeaclaveManagement for TeaclaveManagementService {
             ServiceError::PermissionDenied
         );
 
-        ensure!(
-            task.status == TaskStatus::Created,
-            ServiceError::PermissionDenied
-        );
-
-        for (data_name, data_id) in request.input_map.iter() {
+        for (data_name, data_id) in request.inputs.iter() {
             let file: TeaclaveInputFile = self
                 .read_from_db(&data_id)
                 .map_err(|_| ServiceError::PermissionDenied)?;
-            task.assign_input(&user_id, data_name, &file)
+            task.assign_input(&user_id, data_name, file)
                 .map_err(|_| ServiceError::PermissionDenied)?;
         }
 
-        for (data_name, data_id) in request.output_map.iter() {
+        for (data_name, data_id) in request.outputs.iter() {
             let file: TeaclaveOutputFile = self
                 .read_from_db(&data_id)
                 .map_err(|_| ServiceError::PermissionDenied)?;
-            task.assign_output(&user_id, data_name, &file)
+            task.assign_output(&user_id, data_name, file)
                 .map_err(|_| ServiceError::PermissionDenied)?;
-        }
-
-        if task.all_data_assigned() {
-            task.update_status(TaskStatus::DataAssigned);
         }
 
         log::info!("AssignData: {:?}", task);
@@ -398,20 +385,8 @@ impl TeaclaveManagement for TeaclaveManagementService {
             .read_from_db(&request.task_id)
             .map_err(|_| ServiceError::PermissionDenied)?;
 
-        ensure!(
-            task.participants.contains(&user_id),
-            ServiceError::PermissionDenied
-        );
-
-        ensure!(
-            task.status == TaskStatus::DataAssigned,
-            ServiceError::PermissionDenied,
-        );
-
-        task.approved_users.insert(user_id);
-        if task.all_approved() {
-            task.update_status(TaskStatus::Approved);
-        }
+        task.approve(&user_id)
+            .map_err(|_| ServiceError::PermissionDenied)?;
 
         log::info!("ApproveTask: approve:{:?}", task);
 
@@ -437,6 +412,7 @@ impl TeaclaveManagement for TeaclaveManagementService {
 
         log::info!("InvokeTask: get task: {:?}", task);
 
+        // Early validation
         ensure!(task.creator == user_id, ServiceError::PermissionDenied);
         ensure!(
             task.status == TaskStatus::Approved,
@@ -449,42 +425,11 @@ impl TeaclaveManagement for TeaclaveManagementService {
 
         log::info!("InvokeTask: get function: {:?}", function);
 
-        let mut input_map: HashMap<String, FunctionInputFile> = HashMap::new();
-        let mut output_map: HashMap<String, FunctionOutputFile> = HashMap::new();
-        for (data_name, data_id) in task.input_map.iter() {
-            let input_file: TeaclaveInputFile = self
-                .read_from_db(&data_id)
-                .map_err(|_| ServiceError::PermissionDenied)?;
-            let input_data = FunctionInputFile::from_teaclave_input_file(&input_file);
-            input_map.insert(data_name.to_string(), input_data);
-        }
+        let staged_task = task.stage_for_running(&user_id, function)?;
 
-        for (data_name, data_id) in task.output_map.iter() {
-            let output_file: TeaclaveOutputFile = self
-                .read_from_db(&data_id)
-                .map_err(|_| ServiceError::PermissionDenied)?;
-            ensure!(output_file.cmac.is_none(), ServiceError::PermissionDenied);
-            let output_data = FunctionOutputFile::from_teaclave_output_file(&output_file);
-            output_map.insert(data_name.to_string(), output_data);
-        }
-
-        let function_arguments = task.function_arguments.clone();
-
-        let staged_task = StagedTask::new()
-            .task_id(task.task_id)
-            .executor(task.executor)
-            .executor_type(function.executor_type)
-            .function_id(function.id)
-            .function_payload(function.payload)
-            .function_arguments(function_arguments)
-            .input_data(input_map)
-            .output_data(output_map);
+        log::info!("InvokeTask: staged task: {:?}", staged_task);
 
         self.enqueue_to_db(StagedTask::get_queue_key().as_bytes(), &staged_task)?;
-        task.status = TaskStatus::Running;
-
-        log::info!("InvokeTask: staged task: {:?}", task);
-
         self.write_to_db(&task)
             .map_err(|_| ServiceError::StorageError)?;
         Ok(InvokeTaskResponse)
@@ -492,10 +437,7 @@ impl TeaclaveManagement for TeaclaveManagementService {
 }
 
 impl TeaclaveManagementService {
-    pub(crate) fn new(
-        storage_service_endpoint: Endpoint,
-        fusion_base_dir: PathBuf,
-    ) -> Result<Self> {
+    pub(crate) fn new(storage_service_endpoint: Endpoint) -> Result<Self> {
         let mut i = 0;
         let channel = loop {
             match storage_service_endpoint.connect() {
@@ -509,33 +451,21 @@ impl TeaclaveManagementService {
             std::thread::sleep(std::time::Duration::from_secs(3));
         };
         let storage_client = Arc::new(Mutex::new(TeaclaveStorageClient::new(channel)?));
-        let service = Self {
-            storage_client,
-            fusion_base_dir,
-        };
+        let service = Self { storage_client };
 
         #[cfg(test_mode)]
         service.add_mock_data()?;
 
         Ok(service)
     }
-    pub fn create_fusion_data(&self, owner: impl Into<OwnerList>) -> Result<TeaclaveOutputFile> {
+
+    pub fn create_fusion_data(&self, owners: impl Into<OwnerList>) -> Result<TeaclaveOutputFile> {
         let uuid = Uuid::new_v4();
-        let url = format!(
-            "file://{}/{}.fusion",
-            self.fusion_base_dir.display(),
-            uuid.to_string()
-        );
+        let url = format!("fusion:///TEACLAVE_FUSION_BASE/{}.fusion", uuid.to_string());
         let url = Url::parse(&url).map_err(|_| anyhow!("invalid url"))?;
         let crypto_info = FileCrypto::default();
 
-        Ok(TeaclaveOutputFile {
-            url,
-            cmac: None,
-            crypto_info,
-            owner: owner.into(),
-            uuid,
-        })
+        Ok(TeaclaveOutputFile::new(url, crypto_info, owners))
     }
 
     fn get_request_user_id(
@@ -586,6 +516,7 @@ impl TeaclaveManagementService {
 
     #[cfg(test_mode)]
     fn add_mock_data(&self) -> Result<()> {
+        use teaclave_types::{FileAuthTag, FunctionInput, FunctionOutput};
         let mut output_file = self.create_fusion_data(vec!["mock_user1", "frontend_user"])?;
         output_file.uuid = Uuid::parse_str("00000000-0000-0000-0000-000000000001")?;
         output_file.cmac = Some(FileAuthTag::mock());
@@ -638,7 +569,10 @@ impl TeaclaveManagementService {
 pub mod tests {
     use super::*;
     use std::collections::HashMap;
-    use teaclave_types::{hashmap, FileCrypto, FunctionArguments, FunctionInput, FunctionOutput};
+    use teaclave_types::{
+        hashmap, Executor, FileAuthTag, FileCrypto, FunctionArguments, FunctionInput,
+        FunctionInputFile, FunctionOutput, FunctionOutputFile,
+    };
     use url::Url;
 
     pub fn handle_input_file() {
@@ -694,11 +628,12 @@ pub mod tests {
         let task = Task::new(
             UserID::from("mock_user"),
             Executor::MesaPy,
-            &function,
             function_arguments,
             HashMap::new(),
             HashMap::new(),
-        );
+            function,
+        )
+        .unwrap();
 
         assert!(Task::match_prefix(&task.key_string()));
         let value = task.to_vec().unwrap();

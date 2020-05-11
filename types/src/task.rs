@@ -130,7 +130,6 @@ pub enum TaskStatus {
     DataAssigned,
     Approved,
     Staged,
-    DataPreparing,
     Running,
     Finished,
 }
@@ -351,6 +350,153 @@ where
     }
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct TaskFileOwners {
+    inner: HashMap<String, OwnerList>,
+}
+
+impl TaskFileOwners {
+    pub fn all_owners(&self) -> OwnerList {
+        OwnerList::unions(self.inner.values().cloned())
+    }
+
+    pub fn keys(&self) -> std::collections::hash_map::Keys<String, OwnerList> {
+        self.inner.keys()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn get(&self, key: &str) -> Option<&OwnerList> {
+        self.inner.get(key)
+    }
+
+    pub fn check(&self, fkey: &str, fowners: &OwnerList) -> Result<()> {
+        match self.inner.get(fkey) {
+            Some(owner_list) => {
+                ensure!(
+                    owner_list == fowners,
+                    "Assign: file ownership mismatch. {:?}",
+                    fkey
+                );
+            }
+            None => bail!("Assign: file name not exist in ownership spec. {:?}", fkey),
+        };
+        Ok(())
+    }
+}
+
+impl<V> std::iter::FromIterator<(String, V)> for TaskFileOwners
+where
+    V: Into<OwnerList>,
+{
+    fn from_iter<T: IntoIterator<Item = (String, V)>>(iter: T) -> Self {
+        TaskFileOwners {
+            inner: HashMap::from_iter(iter.into_iter().map(|(k, v)| (k, v.into()))),
+        }
+    }
+}
+
+impl IntoIterator for TaskFileOwners {
+    type Item = (String, OwnerList);
+    type IntoIter = std::collections::hash_map::IntoIter<String, OwnerList>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.into_iter()
+    }
+}
+
+impl std::convert::From<HashMap<String, OwnerList>> for TaskFileOwners {
+    fn from(input: HashMap<String, OwnerList>) -> Self {
+        input.into_iter().collect()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TaskFiles<T: Clone> {
+    inner: HashMap<String, T>,
+}
+
+impl<T> Default for TaskFiles<T>
+where
+    T: Clone,
+{
+    fn default() -> TaskFiles<T> {
+        TaskFiles::<T> {
+            inner: HashMap::new(),
+        }
+    }
+}
+
+impl<T> TaskFiles<T>
+where
+    T: Clone + Storable,
+{
+    pub fn assign(&mut self, fname: &str, file: T) -> Result<()> {
+        ensure!(
+            self.inner.get(fname).is_none(),
+            "Assign: file already assigned. {:?}",
+            fname
+        );
+        self.inner.insert(fname.to_owned(), file);
+        Ok(())
+    }
+
+    pub fn keys(&self) -> std::collections::hash_map::Keys<String, T> {
+        self.inner.keys()
+    }
+
+    pub fn external_ids(&self) -> HashMap<String, ExternalID> {
+        self.inner
+            .iter()
+            .map(|(fname, file)| (fname.to_string(), file.external_id()))
+            .collect()
+    }
+}
+
+impl TaskFiles<TeaclaveOutputFile> {
+    pub fn update_cmac(
+        &mut self,
+        fname: &str,
+        auth_tag: &FileAuthTag,
+    ) -> Result<&TeaclaveOutputFile> {
+        let file = match self.inner.get_mut(fname) {
+            Some(file) => {
+                file.assign_cmac(auth_tag)?;
+                file
+            }
+            _ => bail!("Upadate_cmac: file not found. {:?}", fname),
+        };
+
+        Ok(file)
+    }
+}
+
+impl<T> IntoIterator for TaskFiles<T>
+where
+    T: Clone,
+{
+    type Item = (String, T);
+    type IntoIter = std::collections::hash_map::IntoIter<String, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.into_iter()
+    }
+}
+
+impl std::convert::From<TaskFiles<TeaclaveInputFile>> for FunctionInputFiles {
+    fn from(files: TaskFiles<TeaclaveInputFile>) -> Self {
+        files.into_iter().collect()
+    }
+}
+
+impl std::convert::From<TaskFiles<TeaclaveOutputFile>> for FunctionOutputFiles {
+    fn from(files: TaskFiles<TeaclaveOutputFile>) -> Self {
+        files.into_iter().collect()
+    }
+}
+
 const TASK_PREFIX: &str = "task";
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -360,13 +506,13 @@ pub struct Task {
     pub function_id: ExternalID,
     pub function_arguments: FunctionArguments,
     pub executor: Executor,
-    pub input_owners_map: HashMap<String, OwnerList>,
-    pub output_owners_map: HashMap<String, OwnerList>,
+    pub inputs_ownership: TaskFileOwners,
+    pub outputs_ownership: TaskFileOwners,
     pub function_owner: UserID,
     pub participants: UserList,
     pub approved_users: UserList,
-    pub input_map: HashMap<String, ExternalID>,
-    pub output_map: HashMap<String, ExternalID>,
+    pub assigned_inputs: TaskFiles<TeaclaveInputFile>,
+    pub assigned_outputs: TaskFiles<TeaclaveOutputFile>,
     pub result: TaskResult,
     pub status: TaskStatus,
 }
@@ -384,113 +530,162 @@ impl Storable for Task {
 impl Task {
     pub fn new(
         requester: UserID,
-        executor: Executor,
-        function: &Function,
-        function_arguments: FunctionArguments,
-        input_owners_map: HashMap<String, OwnerList>,
-        output_owners_map: HashMap<String, OwnerList>,
-    ) -> Self {
-        let input_owners = UserList::unions(input_owners_map.values().cloned());
-        let output_owners = UserList::unions(output_owners_map.values().cloned());
+        req_executor: Executor,
+        req_func_args: FunctionArguments,
+        req_input_owners: impl Into<TaskFileOwners>,
+        req_output_owners: impl Into<TaskFileOwners>,
+        function: Function,
+    ) -> Result<Self> {
+        let req_input_owners = req_input_owners.into();
+        let req_output_owners = req_output_owners.into();
+
+        // gather all participants
+        let input_owners = req_input_owners.all_owners();
+        let output_owners = req_output_owners.all_owners();
         let mut participants = UserList::unions(vec![input_owners, output_owners]);
         participants.insert(requester.clone());
         if !function.public {
             participants.insert(function.owner.clone());
         }
 
-        Task {
+        //check function compatibility
+        let fn_args_spec: HashSet<&String> = function.arguments.iter().collect();
+        let req_args: HashSet<&String> = req_func_args.inner().keys().collect();
+        ensure!(fn_args_spec == req_args, "function_arguments mismatch");
+
+        // check input fkeys
+        let inputs_spec: HashSet<&String> = function.inputs.iter().map(|f| &f.name).collect();
+        let req_input_fkeys: HashSet<&String> = req_input_owners.keys().collect();
+        ensure!(inputs_spec == req_input_fkeys, "input keys mismatch");
+
+        // check output fkeys
+        let outputs_spec: HashSet<&String> = function.outputs.iter().map(|f| &f.name).collect();
+        let req_output_fkeys: HashSet<&String> = req_output_owners.keys().collect();
+        ensure!(outputs_spec == req_output_fkeys, "output keys mismatch");
+
+        // Skip the assignment if no file is required
+        let status = if req_input_owners.is_empty() && req_output_owners.is_empty() {
+            TaskStatus::DataAssigned
+        } else {
+            TaskStatus::Created
+        };
+
+        let task = Task {
             task_id: Uuid::new_v4(),
             creator: requester,
-            executor,
+            executor: req_executor,
             function_id: function.external_id(),
             function_owner: function.owner.clone(),
-            function_arguments,
-            input_owners_map,
-            output_owners_map,
+            function_arguments: req_func_args,
+            inputs_ownership: req_input_owners,
+            outputs_ownership: req_output_owners,
             participants,
+            status,
             ..Default::default()
-        }
+        };
+
+        Ok(task)
     }
 
-    pub fn update_status(&mut self, status: TaskStatus) {
-        self.status = status;
-    }
-
-    pub fn check_function_compatibility(&self, function: &Function) -> Result<()> {
-        // check arguments
-        let function_arguments: HashSet<&String> = function.arguments.iter().collect();
-        let provide_args: HashSet<&String> = self.function_arguments.inner().keys().collect();
+    pub fn approve(&mut self, requester: &UserID) -> Result<()> {
         ensure!(
-            function_arguments == provide_args,
-            "function_arguments mismatch"
+            self.status == TaskStatus::DataAssigned,
+            "Unexpected task status when approving: {:?}",
+            self.status
         );
 
-        // check input
-        let input_args: HashSet<String> = function.inputs.iter().map(|f| f.name.clone()).collect();
-        let provide_args: HashSet<String> = self.input_owners_map.keys().cloned().collect();
-        ensure!(input_args == provide_args, "input keys mismatch");
+        ensure!(
+            self.participants.contains(requester),
+            "Unexpected user trying to approve a task: {:?}",
+            requester
+        );
 
-        // check output
-        let output_args: HashSet<String> =
-            function.outputs.iter().map(|f| f.name.clone()).collect();
-        let provide_args: HashSet<String> = self.output_owners_map.keys().cloned().collect();
-        ensure!(output_args == provide_args, "output keys mismatch");
+        self.approved_users.insert(requester.clone());
+        if self.participants == self.approved_users {
+            self.update_status(TaskStatus::Approved);
+        }
 
         Ok(())
     }
 
-    pub fn all_data_assigned(&self) -> bool {
-        let input_args: HashSet<String> = self.input_owners_map.keys().cloned().collect();
-        let assiged_inputs: HashSet<String> = self.input_map.keys().cloned().collect();
-        if input_args != assiged_inputs {
-            return false;
-        }
-
-        let output_args: HashSet<String> = self.output_owners_map.keys().cloned().collect();
-        let assiged_outputs: HashSet<String> = self.output_map.keys().cloned().collect();
-        if output_args != assiged_outputs {
-            return false;
-        }
-
-        true
+    pub fn invoking_by_executor(&mut self) -> Result<()> {
+        ensure!(
+            self.status == TaskStatus::Staged,
+            "Unexpected task status when invoked: {:?}",
+            self.status
+        );
+        self.status = TaskStatus::Running;
+        Ok(())
     }
 
-    pub fn all_approved(&self) -> bool {
-        self.participants == self.approved_users
+    pub fn finish(&mut self, result: TaskResult) -> Result<()> {
+        ensure!(
+            self.status == TaskStatus::Running,
+            "Unexpected task status when invoked: {:?}",
+            self.status
+        );
+        self.result = result;
+        self.status = TaskStatus::Finished;
+        Ok(())
+    }
+
+    pub fn stage_for_running(
+        &mut self,
+        requester: &UserID,
+        function: Function,
+    ) -> Result<StagedTask> {
+        ensure!(
+            &self.creator == requester,
+            "Unexpected user trying to invoke a task: {:?}",
+            requester
+        );
+        ensure!(
+            self.status == TaskStatus::Approved,
+            "Unexpected task status when invoked: {:?}",
+            self.status
+        );
+        let function_arguments = self.function_arguments.clone();
+        let staged_task = StagedTask {
+            task_id: self.task_id,
+            executor: self.executor,
+            executor_type: function.executor_type,
+            function_id: function.id,
+            function_name: function.name,
+            function_payload: function.payload,
+            function_arguments,
+            input_data: self.assigned_inputs.clone().into(),
+            output_data: self.assigned_outputs.clone().into(),
+        };
+
+        self.update_status(TaskStatus::Staged);
+        Ok(staged_task)
     }
 
     pub fn assign_input(
         &mut self,
         requester: &UserID,
         fname: &str,
-        file: &TeaclaveInputFile,
+        file: TeaclaveInputFile,
     ) -> Result<()> {
+        ensure!(
+            self.status == TaskStatus::Created,
+            "Unexpected task status during input assignment: {:?}",
+            self.status
+        );
+
         ensure!(
             file.owner.contains(requester),
             "Assign: requester is not in the owner list. {:?}.",
             file.external_id()
         );
 
-        match self.input_owners_map.get(fname) {
-            Some(owner_list) => {
-                ensure!(
-                    owner_list == &file.owner,
-                    "Assign: file ownership mismatch. {:?}",
-                    file.external_id()
-                );
-            }
-            None => bail!(
-                "Assign: file name not exist in input_owners_map. {:?}",
-                fname
-            ),
-        };
+        self.inputs_ownership.check(fname, &file.owner)?;
 
-        ensure!(
-            self.input_map.get(fname).is_none(),
-            "Assign: file already assigned. {:?}",
-            fname
-        );
-        self.input_map.insert(fname.to_owned(), file.external_id());
+        self.assigned_inputs.assign(fname, file)?;
+
+        if self.all_data_assigned() {
+            self.update_status(TaskStatus::DataAssigned);
+        }
         Ok(())
     }
 
@@ -498,34 +693,47 @@ impl Task {
         &mut self,
         requester: &UserID,
         fname: &str,
-        file: &TeaclaveOutputFile,
+        file: TeaclaveOutputFile,
     ) -> Result<()> {
+        ensure!(
+            self.status == TaskStatus::Created,
+            "Unexpected task status during output assignment: {:?}",
+            self.status
+        );
+
         ensure!(
             file.owner.contains(requester),
             "Assign: requester is not in the owner list. {:?}.",
             file.external_id()
         );
 
-        match self.output_owners_map.get(fname) {
-            Some(owner_list) => {
-                ensure!(
-                    owner_list == &file.owner,
-                    "Assign: file ownership mismatch. {:?}",
-                    file.external_id()
-                );
-            }
-            None => bail!(
-                "Assign: file name not exist in output_owners_map. {:?}",
-                fname
-            ),
-        };
+        self.outputs_ownership.check(fname, &file.owner)?;
 
-        ensure!(
-            self.output_map.get(fname).is_none(),
-            "Assign: file already assigned. {:?}",
-            fname
-        );
-        self.output_map.insert(fname.to_owned(), file.external_id());
+        self.assigned_outputs.assign(fname, file)?;
+
+        if self.all_data_assigned() {
+            self.update_status(TaskStatus::DataAssigned);
+        }
         Ok(())
+    }
+
+    fn update_status(&mut self, status: TaskStatus) {
+        self.status = status;
+    }
+
+    fn all_data_assigned(&self) -> bool {
+        let input_args: HashSet<&String> = self.inputs_ownership.keys().collect();
+        let assiged_inputs: HashSet<&String> = self.assigned_inputs.keys().collect();
+        if input_args != assiged_inputs {
+            return false;
+        }
+
+        let output_args: HashSet<&String> = self.outputs_ownership.keys().collect();
+        let assiged_outputs: HashSet<&String> = self.assigned_outputs.keys().collect();
+        if output_args != assiged_outputs {
+            return false;
+        }
+
+        true
     }
 }
